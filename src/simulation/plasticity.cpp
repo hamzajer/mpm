@@ -1,0 +1,776 @@
+// Copyright (C) 2024 Lars Blatny. Released under GPL-3.0 license.
+
+#include "simulation.hpp"
+#include "../plasticity_helpers/mcc_rma_explicit.hpp"
+#include "../plasticity_helpers/mcc_rma_explicit_onevar.hpp"
+#include "../plasticity_helpers/mcc_rma_implicit_exponential.hpp"
+#include "../plasticity_helpers/mcc_rma_implicit_exponential_onevar.hpp"
+#include "../plasticity_helpers/mcc_rma_implicit_sinh_onevar.hpp"
+
+void Simulation::plasticity(unsigned int p, unsigned int & plastic_count, TM & Fe_trial){
+
+    if (plastic_model == PlasticModel::NoPlasticity){
+
+        Eigen::JacobiSVD<TM> svd(Fe_trial, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        TV hencky = svd.singularValues().array().abs().max(1e-4).log();
+
+        particles.F[p] = Fe_trial;
+        TM Fe = particles.F[p];
+        TM dPsidF;
+        if (elastic_model == ElasticModel::NeoHookean){
+            dPsidF = mu * (Fe - Fe.transpose().inverse()) + lambda * std::log(Fe.determinant()) * Fe.transpose().inverse();
+            particles.tau[p] = dPsidF * Fe.transpose();
+        }
+        else if (elastic_model == ElasticModel::Hencky){ // St Venant Kirchhoff with Hencky strain
+            T e_trace = hencky.sum();
+            TV Kirchhoff_principal = lambda*e_trace*TV::Ones() + T(2.)*mu*hencky;
+            particles.tau[p] = svd.matrixU() * Kirchhoff_principal.array().matrix().asDiagonal() * svd.matrixU().transpose();
+        }
+    }
+
+    else if (plastic_model == PlasticModel::VM || plastic_model == PlasticModel::DP || plastic_model == PlasticModel::DPSoft || plastic_model == PlasticModel::MCC || plastic_model == PlasticModel::VMVisc || plastic_model == PlasticModel::DPVisc || plastic_model == PlasticModel::MCCVisc || plastic_model == PlasticModel::DPMui || plastic_model == PlasticModel::MCCMui){
+
+        Eigen::JacobiSVD<TM> svd(Fe_trial, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        // TV hencky = svd.singularValues().array().log();
+        TV hencky = svd.singularValues().array().abs().max(1e-4).log();
+        T  hencky_trace = hencky.sum();
+        TV hencky_deviatoric = hencky - (hencky_trace / dim) * TV::Ones();
+        T  hencky_deviatoric_norm = hencky_deviatoric.norm();
+
+        if (hencky_deviatoric_norm > 0)
+            hencky_deviatoric /= hencky_deviatoric_norm; // normalize the deviatoric vector so it gives a unit vector specifying the deviatoric direction
+
+        T eps_pl_vol_inst = 0;
+        T eps_pl_dev_inst = 0;
+
+        if (plastic_model == PlasticModel::VM){
+
+            T q_yield = q_max;
+
+            // If hardening law:
+            // q_yield = f(q_max, hardening variable) ....
+
+            T delta_gamma = hencky_deviatoric_norm - q_yield / e_mu_prefac; // this is eps_pl_dev_inst
+
+            if (delta_gamma > 0){ // project to yield surface
+                plastic_count++;
+                particles.delta_gamma[p] = d_prefac * delta_gamma / dt;
+
+                hencky -= delta_gamma * hencky_deviatoric;
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+                eps_pl_dev_inst = delta_gamma;
+                particles.eps_pl_dev[p] += eps_pl_dev_inst;
+
+            } // end plastic projection
+
+        } // end VonMises
+
+        else if (plastic_model == PlasticModel::DP){
+
+            // trial stresses
+            T p_trial = -K * hencky_trace;
+            T q_trial = e_mu_prefac * hencky_deviatoric_norm;
+
+            T q_yield = M * p_trial + q_cohesion;
+
+            // left of tip
+            if (q_yield < 1e-10){
+                plastic_count++;
+
+                T p_proj = -q_cohesion/M; // larger than p_trial
+                hencky = -p_proj/(K*dim) * TV::Ones();
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+
+                T delta_gamma = d_prefac * hencky_deviatoric_norm;
+                particles.delta_gamma[p] = delta_gamma / dt;
+                eps_pl_dev_inst = (1.0/d_prefac) * delta_gamma;
+                eps_pl_vol_inst = (p_proj-p_trial)/K;
+
+                particles.eps_pl_dev[p] += eps_pl_dev_inst;
+                particles.eps_pl_vol[p] += eps_pl_vol_inst;
+                              
+            }
+            else{ // right of tip
+                T delta_gamma = d_prefac * (hencky_deviatoric_norm - q_yield / e_mu_prefac);
+
+                if (delta_gamma > 0){ // project to yield surface
+                    plastic_count++;
+                    particles.delta_gamma[p] = delta_gamma / dt;
+
+                    hencky -= (1.0/d_prefac) * delta_gamma * hencky_deviatoric;
+                    particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+                    
+                    eps_pl_dev_inst = (1.0/d_prefac) * delta_gamma;
+                    particles.eps_pl_dev[p] += eps_pl_dev_inst;
+                }
+            } // if else side of tip
+
+        } // end DP
+
+        else if (plastic_model == PlasticModel::DPSoft){
+
+            // trial stresses
+            T p_trial = -K * hencky_trace;
+            T q_trial = e_mu_prefac * hencky_deviatoric_norm;
+
+            T p_tip_orig = -q_cohesion/M;
+            T p_tip      = p_tip_orig * std::exp(-xi * particles.eps_pl_dev[p]);
+            T p_shift = 0;
+            if (use_pradhana)
+                p_shift = -K * particles.eps_pl_vol_pradhana[p]; // Negative if volume gain!
+
+            // if positive volume gain, the q=0 intersection for the plastic potential surface is shifted to the right, at a larger p.
+            T q_yield = M * (p_trial+p_shift) + (-p_tip*M); // not sure if we should really shift this intersection!!!
+
+            // if left of shifted tip,
+            // => project to the original tip given by cohesion only (i.e., not the shifted tip)
+            if ((p_trial+p_shift) <= p_tip){
+                plastic_count++;
+
+                T p_proj = p_tip_orig * std::exp(-xi * particles.eps_pl_dev[p]); // > p_trial
+                hencky = -p_proj/(K*dim) * TV::Ones();
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+
+                T delta_gamma = d_prefac * hencky_deviatoric_norm;
+                particles.delta_gamma[p] = delta_gamma / dt;
+                eps_pl_dev_inst = (1.0/d_prefac) * delta_gamma;
+                particles.eps_pl_dev[p] += eps_pl_dev_inst;
+
+                eps_pl_vol_inst = (p_proj-p_trial)/K;
+                particles.eps_pl_vol[p] += eps_pl_vol_inst;
+                if (use_pradhana)
+                    particles.eps_pl_vol_pradhana[p] += eps_pl_vol_inst; // can be negative!
+            }
+
+            // right of tip AND inside yield surface, i.e., elastic states
+            if ((p_trial+p_shift) > p_tip && q_trial <= q_yield) {
+                if (use_pradhana)
+                    particles.eps_pl_vol_pradhana[p] = 0; // reset correction as no longer dilating
+                particles.delta_gamma[p] = 0; // elastic particles have no delta_gamma
+            }
+
+            // right of tip AND outside yield surface
+            if ((p_trial+p_shift) > p_tip && q_trial > q_yield) {
+                plastic_count++;
+
+                T temp_eps_pl_dev = particles.eps_pl_dev[p] + (hencky_deviatoric_norm - q_yield / e_mu_prefac);
+                T p_proj          = p_tip_orig * std::exp(-xi * temp_eps_pl_dev);
+
+                // if left of tip: project from p_trial to p_proj
+                if ((p_trial+p_shift) < p_proj){
+                    T delta_gamma             = d_prefac * hencky_deviatoric_norm;
+                    particles.delta_gamma[p]  = delta_gamma / dt;
+                    eps_pl_dev_inst = (1.0/d_prefac) * delta_gamma;
+                    particles.eps_pl_dev[p] += eps_pl_dev_inst;
+
+                    eps_pl_vol_inst = (p_proj-p_trial)/K;
+                    particles.eps_pl_vol[p] += eps_pl_vol_inst;
+                    if (use_pradhana)
+                        particles.eps_pl_vol_pradhana[p] += eps_pl_vol_inst; // can be negative!
+
+                    hencky = -p_proj/(K*dim) * TV::Ones();
+                    particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+                }
+                // if right of tip: p_trial becomes p
+                else{
+                    T q_yield_new = M * (p_trial+p_shift) + (-p_proj*M) ;
+                    T delta_gamma = d_prefac * (hencky_deviatoric_norm - q_yield_new / e_mu_prefac);
+                    hencky -= (1.0/d_prefac) * delta_gamma * hencky_deviatoric;
+                    particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+                    eps_pl_dev_inst = (1.0/d_prefac) * delta_gamma;
+                    particles.eps_pl_dev[p] += eps_pl_dev_inst;
+                    particles.delta_gamma[p] = delta_gamma / dt;
+                    if (use_pradhana)
+                        particles.eps_pl_vol_pradhana[p] = 0; // reset volume accumulation
+                }
+            } // end plastic projection projection
+
+        } // end DPSoft
+
+        else if (plastic_model == PlasticModel::VMVisc){
+
+            // trial
+            T q_trial = e_mu_prefac * hencky_deviatoric_norm;
+
+            // yield
+            T q_yield = q_min + (q_max - q_min) * exp(-xi * particles.eps_pl_dev[p]);
+
+            //////////////// Only for capped von Mises /////////////////
+            T p_trial = -K * hencky_trace;
+            if (p_trial < p_min * exp(-xi * particles.eps_pl_vol[p])){
+                T delta_gamma = q_trial / f_mu_prefac;
+                eps_pl_vol_inst = -p_trial/K;
+                particles.F[p] = svd.matrixU() * svd.matrixV().transpose();
+                particles.eps_pl_vol[p] += eps_pl_vol_inst;
+                particles.eps_pl_dev[p] += (1.0/d_prefac) * delta_gamma;
+                particles.delta_gamma[p] = delta_gamma / dt;
+            }
+            ////////////////////////////////////////////////////////////
+
+            else if (q_trial > q_yield) {
+                plastic_count++;
+                T delta_gamma;
+
+                if (visc_exponent == 1 && xi == 0){
+                    if (use_duvaut_lions_formulation){
+                        delta_gamma = (q_trial-q_yield) / (f_mu_prefac*(1+visc_time/dt));
+                    }
+                    else{ // perzyna
+                        delta_gamma = (q_trial-q_yield) / (f_mu_prefac + q_yield*visc_time/dt);
+                    }
+                    if (delta_gamma < 0){
+                        debug("VMVisc: FATAL negative delta_gamma = ", delta_gamma);
+                        exit = 1;
+                    }
+                }
+                else{
+
+                    delta_gamma = 0.01 * (q_trial - q_yield) / f_mu_prefac; // initial guess
+                    int max_iter = 60;
+                    T residual;
+                    T residual_diff;
+                    for (int iter = 0; iter < max_iter; iter++) {
+                        if (iter == max_iter - 1){ // did not break loop
+                            debug("VMVisc: FATAL did not exit loop at iter = ", iter);
+                            exit = 1;
+                        }
+
+                        q_yield = q_min + (q_max - q_min) * exp(-xi * (particles.eps_pl_dev[p] + (1.0/d_prefac) * delta_gamma));
+                        T q_yield_diff = -xi / d_prefac * (q_max - q_min) * exp(-xi * (particles.eps_pl_dev[p] + (1.0/d_prefac) * delta_gamma));
+
+                                                
+                        if (use_duvaut_lions_formulation){
+
+                            residual = q_trial - q_yield - f_mu_prefac * ( std::pow(visc_time/dt*delta_gamma, visc_exponent) + delta_gamma );
+                            if (std::abs(residual) < 1e-2) {
+                                break;
+                            }
+                            residual_diff = - q_yield_diff - f_mu_prefac * ( std::pow(visc_time/dt, visc_exponent) * visc_exponent * std::pow(delta_gamma, visc_exponent-1) + 1 );
+
+                        }
+                        else{ // perzyna
+
+                            T tm = visc_time * delta_gamma + dt;
+                            T tmp = dt / tm;
+                            T tmp1 = std::pow(tmp, visc_exponent);
+
+                            residual = (q_trial - f_mu_prefac * delta_gamma) * tmp1 - q_yield;
+                            if (std::abs(residual) < 1e-2) {
+                                break;
+                            }
+
+                            residual_diff = -f_mu_prefac * tmp1 + (q_trial - f_mu_prefac * delta_gamma) * visc_exponent * std::pow(tmp, visc_exponent - 1) * (-visc_time * dt) / (tm * tm) - q_yield_diff;
+                        }
+
+                        T diff_tol = 1e-14;
+                        if (std::abs(residual_diff) < diff_tol){ // otherwise division by zero
+                            debug("VMVisc: WARNING residual_diff too small in abs value = ", residual_diff);
+                            residual_diff = (residual_diff >= 0 ? diff_tol : -diff_tol);
+                        }
+
+                        delta_gamma -= residual / residual_diff;
+
+                        if (delta_gamma < 0) // not possible and can also lead to division by zero
+                            delta_gamma = 1e-10;
+
+                    } // end N-R iterations
+                } // end if visc_exponent > 1
+
+                eps_pl_dev_inst = (1.0/d_prefac) * delta_gamma;
+                hencky -= eps_pl_dev_inst * hencky_deviatoric;
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+                
+                particles.eps_pl_dev[p] += eps_pl_dev_inst;
+                particles.delta_gamma[p] = delta_gamma / dt;
+
+            } // end plastic projection projection
+
+        } // end VMVisc
+
+        else if (plastic_model == PlasticModel::DPVisc){
+
+            // trial stresses
+            T p_trial = -K * hencky_trace;
+            T q_trial = e_mu_prefac * hencky_deviatoric_norm;
+
+            T p_tip   = -q_cohesion/M;
+            T p_shift = 0;
+            if (use_pradhana)
+                p_shift = -K * particles.eps_pl_vol_pradhana[p]; // Negative if volume gain! Force to be zero if using classical volume-expanding non-ass. DP
+
+            // if positive volume gain, the q=0 intersection for the yield surface is shifted to the right, at a larger p.
+            T q_yield = M * (p_trial+p_shift) + q_cohesion;
+
+            if (use_mibf)
+                particles.muI[p] = M;
+
+            // if left of shifted tip,
+            // => project to the original tip given by cohesion only (i.e., not the shifted tip)
+            if ((p_trial+p_shift) < p_tip){
+                T delta_gamma;
+                T p_proj = p_tip; // > p_trial
+
+                if (use_duvaut_lions_formulation){ // for simplicity visc_exponent is in this special case assumed to be unity
+                    T b = 1.0 / (1.0 + visc_time / dt); 
+
+                    eps_pl_vol_inst = - b * (p_trial - p_proj) / K;
+                    eps_pl_dev_inst =   b * (q_trial - 0     ) / e_mu_prefac;
+
+                    delta_gamma = d_prefac * eps_pl_dev_inst;
+
+                    T h_vol = - p_trial / K         - eps_pl_vol_inst;
+                    T h_dev = q_trial / e_mu_prefac - eps_pl_dev_inst;
+                    hencky = h_dev * hencky_deviatoric + (h_vol/dim) * TV::Ones();
+                }
+                else{
+                    delta_gamma = d_prefac * hencky_deviatoric_norm;
+                    eps_pl_vol_inst = (p_proj-p_trial)/K; // this can be both positive and negative when using Pradhana!
+                    eps_pl_dev_inst = hencky_deviatoric_norm;
+                    hencky = -p_proj/(K*dim) * TV::Ones();
+                }
+
+                plastic_count++;
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+                particles.delta_gamma[p] = delta_gamma / dt;
+                
+                particles.eps_pl_dev[p] += eps_pl_dev_inst;
+                particles.eps_pl_vol[p] += eps_pl_vol_inst;
+
+                if (use_pradhana)
+                    particles.eps_pl_vol_pradhana[p] += eps_pl_vol_inst; // can be negative!
+            }
+            else{ // if right of shifted tip (incl elastic states)
+                if (use_pradhana)
+                    particles.eps_pl_vol_pradhana[p] = 0; // reset pradhana volume accumulation
+                particles.delta_gamma[p] = 0; // for the elastic particles, the plastic particles have their delta_gamma overwritten in the next if-statement
+            }
+
+            // right of shifted tip AND outside the shifted yield surface
+            if ((p_trial+p_shift) > p_tip && q_trial > q_yield) {
+                plastic_count++;
+
+                T delta_gamma;
+
+                if (visc_exponent == 1){
+                    if (use_duvaut_lions_formulation){
+                        delta_gamma = (q_trial-q_yield) / (f_mu_prefac*(1+visc_time/dt));
+                    }
+                    else{ // perzyna
+                        delta_gamma = (q_trial-q_yield) / (f_mu_prefac + q_yield*visc_time/dt);
+                    }
+                    if (delta_gamma < 0){
+                        debug("DPVisc: FATAL negative delta_gamma = ", delta_gamma);
+                        exit = 1;
+                    }
+                }
+                else{ // exponent not equal to one
+
+                    delta_gamma = 0.01 * (q_trial - q_yield) / f_mu_prefac; // initial guess
+
+                    int max_iter = 60;
+                    for (int iter = 0; iter < max_iter; iter++) {
+                        if (iter == max_iter - 1){ // did not break loop
+                            debug("DPVisc: FATAL did not exit loop at iter = ", iter);
+                            exit = 1;
+                        }
+
+                        T residual;
+                        T residual_diff;
+                        if (use_duvaut_lions_formulation){
+
+                            residual = q_trial - q_yield - f_mu_prefac * ( std::pow(visc_time/dt*delta_gamma, visc_exponent) + delta_gamma );
+                            if (std::abs(residual) < 1e-2) {
+                                break;
+                            }
+                            residual_diff = -f_mu_prefac * ( std::pow(visc_time/dt, visc_exponent) * visc_exponent * std::pow(delta_gamma, visc_exponent-1) + 1 );
+
+                        }
+                        else{
+
+                            T tm = visc_time * delta_gamma + dt;
+                            T tmp = dt / tm;
+                            T tmp1 = std::pow(tmp, visc_exponent);
+
+                            residual = (q_trial - f_mu_prefac * delta_gamma) * tmp1 - q_yield;
+                            if (std::abs(residual) < 1e-2) {
+                                break;
+                            }
+                            residual_diff = -f_mu_prefac * tmp1 + (q_trial - f_mu_prefac * delta_gamma) * visc_exponent * std::pow(tmp, visc_exponent - 1) * (-visc_time * dt) / (tm * tm);
+
+                        }
+
+                        T diff_tol = 1e-14;
+                        if (std::abs(residual_diff) < diff_tol){ // otherwise division by zero
+                            debug("DPVisc: WARNING residual_diff too small in abs value = ", residual_diff);
+                            residual_diff = (residual_diff >= 0 ? diff_tol : -diff_tol);
+                        }
+
+                        delta_gamma -= residual / residual_diff;
+
+                        if (delta_gamma < 0) // not possible and can also lead to division by zero
+                            delta_gamma = 1e-10;
+
+                    } // end N-R iterations
+
+                } // end if visc_exponent == 1
+
+                if (use_mibf){
+                    if (std::abs(p_trial + p_shift) < 1e-10)
+                        particles.muI[p] = 1e10;
+                    else
+                        particles.muI[p] = ((q_trial - f_mu_prefac * delta_gamma) - q_cohesion) / (p_trial + p_shift);
+                }
+
+                eps_pl_dev_inst = (1.0/d_prefac) * delta_gamma;
+                hencky -= eps_pl_dev_inst * hencky_deviatoric;
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+                particles.eps_pl_dev[p] += eps_pl_dev_inst;
+                particles.delta_gamma[p] = delta_gamma / dt;
+
+            } // end plastic projection
+        } // end DPVisc
+
+
+        else if (plastic_model == PlasticModel::DPMui){
+
+            // trial stresses
+            T p_trial = -K * hencky_trace;
+            T q_trial = e_mu_prefac * hencky_deviatoric_norm;
+
+            T p_tip   = -q_cohesion/mu_1;
+            T p_shift = 0;
+            if (use_pradhana)
+                p_shift = -K * particles.eps_pl_vol_pradhana[p]; // Negative if volume gain! Force to be zero if using classical volume-expanding non-ass. DP
+
+            particles.muI[p]         = mu_1;
+            particles.viscosity[p]   = 0;
+
+            // if left of shifted tip,
+            // => project to the original tip given by cohesion only (i.e., not the shifted tip)
+            if ((p_trial+p_shift) < p_tip){
+                eps_pl_vol_inst = (p_tip-p_trial) / K;
+                eps_pl_dev_inst = hencky_deviatoric_norm;
+                plastic_count++;
+                hencky = -p_tip/(K*dim) * TV::Ones();
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+                particles.delta_gamma[p]          = d_prefac * eps_pl_dev_inst / dt;
+                particles.eps_pl_dev[p]          += eps_pl_dev_inst;
+                particles.eps_pl_vol[p]          += eps_pl_vol_inst;
+                particles.eps_pl_vol_pradhana[p] += eps_pl_vol_inst; // can be negative!
+            }
+            else{ // if right of shifted tip (incl elastic states)
+                particles.eps_pl_vol_pradhana[p] = 0; // reset pradhana volume accumulation
+            }
+
+            // if positive volume gain, the q=0 intersection for the plastic potential surface is shifted to the right, at a larger p.
+            T q_yield = mu_1 * (p_trial+p_shift) + q_cohesion;
+
+            // right of tip AND outside yield surface
+            if ((p_trial+p_shift) > p_tip && q_trial > (q_yield + stress_tolerance)) {
+
+                plastic_count++;
+
+                T p_special = p_trial+p_shift - p_tip + stress_tolerance; // p_special is positive.
+
+                T fac_a = f_mu_prefac * dt; // always positive
+                T fac_b = p_trial*(mu_2-mu_1) + f_mu_prefac*dt*fac_Q*std::sqrt(p_special) - (q_trial-q_yield);
+                T fac_c = -(q_trial-q_yield) * fac_Q * std::sqrt(p_special); // always negative 
+
+                T delta_gamma; // this is gamma_dot: always positive if because a>0 and c<0
+                T sqrtdet = std::sqrt(fac_b*fac_b - 4*fac_a*fac_c);
+                if (fac_b > 0){
+                    delta_gamma = 2*fac_c / (-fac_b - sqrtdet);
+                }
+                else {
+                    delta_gamma = (-fac_b + sqrtdet) / (2 * fac_a);
+                }
+
+                T mu_i = mu_1 + (mu_2 - mu_1) / (fac_Q * std::sqrt(p_special) / delta_gamma + 1.0);
+                particles.muI[p]       = mu_i;
+                particles.viscosity[p] = (mu_i - mu_1) * p_special / delta_gamma;
+
+                delta_gamma *= dt; // this is the actual delta_gamma
+                particles.delta_gamma[p] = delta_gamma / dt;
+
+                eps_pl_dev_inst = (1.0/d_prefac) * delta_gamma;
+                particles.eps_pl_dev[p] += eps_pl_dev_inst;
+
+                hencky -= eps_pl_dev_inst * hencky_deviatoric;
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+                
+            } // end plastic projection
+
+        } // end DPMui
+
+        else if (plastic_model == PlasticModel::MCCMui) {
+
+            // the trial stress states
+            T p_stress = -K * hencky_trace;
+            T q_stress = e_mu_prefac * hencky_deviatoric_norm;
+
+            // make copies
+            T q_trial = q_stress;
+
+            //////////////////////////////////////////////////////////////////////
+            bool perform_rma;
+            T p_c;
+            if (hardening_law == HardeningLaw::ExpoExpl){ // Exponential Explicit Hardening
+                p_c = std::max(stress_tolerance, p0 * std::exp(-xi*particles.eps_pl_vol[p]));
+                   perform_rma =       MCCRMAExplicit(p_stress, q_stress, exit, mu_1, p_c, beta, mu, K, f_mu_prefac);
+                // perform_rma = MCCRMAExplicitOnevar(p_stress, q_stress, exit, mu_1, p_c, beta, mu, K);
+            }
+            else if (hardening_law == HardeningLaw::SinhExpl){ // Sinh Explicit Hardening
+                p_c = std::max(stress_tolerance, K * std::sinh(-xi*particles.eps_pl_vol[p] + std::asinh(p0/K)));
+                   perform_rma =       MCCRMAExplicit(p_stress, q_stress, exit, mu_1, p_c, beta, mu, K, f_mu_prefac);
+                // perform_rma = MCCRMAExplicitOnevar(p_stress, q_stress, exit, mu_1, p_c, beta, mu, K);
+            }
+            else if (hardening_law == HardeningLaw::ExpoImpl){ // Exponential Implicit Hardening
+                   perform_rma = MCCRMAImplicitExponentialOnevar(p_stress, q_stress, exit, mu_1, p0, beta, mu, K, xi, particles.eps_pl_vol[p]);
+                // perform_rma =       MCCRMAImplicitExponential(p_stress, q_stress, exit, mu_1, p0, beta, mu, K, xi, f_mu_prefac, particles.eps_pl_vol[p]);
+            }
+            else if (hardening_law == HardeningLaw::SinhImpl) {
+                   perform_rma = MCCRMAImplicitSinhOnevar(p_stress, q_stress, exit, mu_1, p0, beta, mu, K, xi, particles.eps_pl_vol[p]);
+                // perform_rma = <no alternative at the moment>
+            }
+            else{
+                debug("You specified an invalid HARDENING LAW!");
+                exit = 1;
+            }
+            //////////////////////////////////////////////////////////////////////
+
+            particles.muI[p] = mu_1;
+            particles.viscosity[p] = 0;
+
+            if (perform_rma){
+                plastic_count++;
+
+                T ep = p_stress / (K*dim);
+                eps_pl_vol_inst = hencky_trace + dim * ep;
+                particles.eps_pl_vol[p] += eps_pl_vol_inst;
+
+                if (q_trial > (q_stress + stress_tolerance)) {
+                    if (hardening_law == HardeningLaw::ExpoImpl){
+                        p_c = std::max( p0 * std::exp(-xi*particles.eps_pl_vol[p]) ,                    p_stress + stress_tolerance );
+                    }
+                    else if (hardening_law == HardeningLaw::SinhImpl){
+                        p_c = std::max( K * std::sinh(-xi*particles.eps_pl_vol[p] + std::asinh(p0/K)) , p_stress + stress_tolerance );
+                    }
+                    T p_special = p_stress + beta * p_c + stress_tolerance; // always larger than 0
+
+                    T fac_a = f_mu_prefac * dt; // always positive
+
+                    T fac_b = std::sqrt((p_c-p_stress)*p_special)*(mu_2-mu_1) + f_mu_prefac*dt*fac_Q*std::sqrt(p_special) - (q_trial-q_stress);
+
+                    T fac_c = -(q_trial-q_stress) * fac_Q * std::sqrt(p_special); // always negative
+
+                    T gamma_dot_S; // always positive because a>0 and c<0
+                    T sqrtdet = std::sqrt(fac_b*fac_b - 4*fac_a*fac_c);
+                    if (fac_b > 0){
+                        gamma_dot_S = 2*fac_c / (-fac_b - sqrtdet);
+                    }
+                    else {
+                        gamma_dot_S = (-fac_b + sqrtdet) / (2 * fac_a);
+                    }
+
+                    q_stress = std::max(q_stress, q_trial - f_mu_prefac * dt * gamma_dot_S); // always smaller than q_trial
+            
+                    T mu_i = mu_1 + (mu_2 - mu_1) / (fac_Q * std::sqrt(p_special) / gamma_dot_S + 1.0);
+                    particles.muI[p] = mu_i;
+                    particles.viscosity[p] = (mu_i - mu_1) * std::sqrt((p_c-p_stress)*p_special) / gamma_dot_S;
+
+                    T delta_gamma = (q_trial - q_stress) / f_mu_prefac;
+                    eps_pl_dev_inst = (1.0/d_prefac) * delta_gamma;
+                    particles.eps_pl_dev[p] += eps_pl_dev_inst;
+                    particles.delta_gamma[p] = delta_gamma / dt;
+                }
+
+                hencky = q_stress / e_mu_prefac * hencky_deviatoric - ep*TV::Ones();
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+            } // end plastic projection
+
+        } // end MCCMui
+
+
+        else if (plastic_model == PlasticModel::MCC || plastic_model == PlasticModel::MCCVisc){
+
+            // the trial stress states
+            T p_stress = -K * hencky_trace;
+            T q_stress = e_mu_prefac * hencky_deviatoric_norm;
+
+            // make copies
+            T p_trial = p_stress;
+            T q_trial = q_stress;
+
+            if (use_mibf)
+                particles.muI[p] = M;
+            
+            bool perform_rma;
+            T p_c;
+            if (hardening_law == HardeningLaw::NoHard){ // Exponential Explicit Hardening
+                   perform_rma =       MCCRMAExplicit(p_stress, q_stress, exit, M, p0, beta, mu, K, f_mu_prefac);
+                // perform_rma = MCCRMAExplicitOnevar(p_stress, q_stress, exit, M, p0, beta, mu, K);
+            }
+            else if (hardening_law == HardeningLaw::ExpoExpl){ // Exponential Explicit Hardening
+                p_c = std::max(stress_tolerance, p0*std::exp(-xi*particles.eps_pl_vol[p]));
+                   perform_rma =       MCCRMAExplicit(p_stress, q_stress, exit, M, p_c, beta, mu, K, f_mu_prefac);
+                // perform_rma = MCCRMAExplicitOnevar(p_stress, q_stress, exit, M, p_c, beta, mu, K);
+            }
+            else if (hardening_law == HardeningLaw::SinhExpl){ // Sinh Explicit Hardening
+                p_c = std::max(stress_tolerance, K*std::sinh(-xi*particles.eps_pl_vol[p] + std::asinh(p0/K)));
+                   perform_rma =       MCCRMAExplicit(p_stress, q_stress, exit, M, p_c, beta, mu, K, f_mu_prefac);
+                // perform_rma = MCCRMAExplicitOnevar(p_stress, q_stress, exit, M, p_c, beta, mu, K);
+            }
+            else if (hardening_law == HardeningLaw::ExpoImpl){ // Exponential Implicit Hardening
+                   perform_rma = MCCRMAImplicitExponentialOnevar(p_stress, q_stress, exit, M, p0, beta, mu, K, xi, particles.eps_pl_vol[p]);
+                // perform_rma =       MCCRMAImplicitExponential(p_stress, q_stress, exit, M, p0, beta, mu, K, xi, f_mu_prefac, particles.eps_pl_vol[p]);
+            }
+            else if (hardening_law == HardeningLaw::SinhImpl) {
+                perform_rma = MCCRMAImplicitSinhOnevar(p_stress, q_stress, exit, M, p0, beta, mu, K, xi, particles.eps_pl_vol[p]);
+            }
+            else{
+                debug("You specified an invalid HARDENING LAW!");
+                exit = 1;
+            }
+
+            if (perform_rma) { // returns true if it performs a return mapping
+                plastic_count++;
+
+                T b = 1; // must be equal to one unless using duvaut lion formulation
+
+                ////////////////////////////////////////////////////////////////
+                if (plastic_model == PlasticModel::MCCVisc){
+                    if (use_duvaut_lions_formulation){
+                        b = 1.0 / (1.0 + visc_time / dt); // b defined such that "stress = (1-b) * strain_trial + b * stress_yield"
+                        if (visc_exponent != 1){
+                            debug("MCCVisc: FATAL viscous exponent must be 1 when use_duvaut_lions_formulation = true");
+                            exit = 1;
+                        }
+                    }
+                    else{ // perzyna
+                        T delta_gamma;
+                        T q_yield = q_stress;
+
+                        if (visc_exponent == 1){
+                            delta_gamma = (q_trial-q_yield) / (f_mu_prefac + q_yield*visc_time/dt);
+                            if (delta_gamma < 0){
+                                if (delta_gamma > -1e-14){
+                                    delta_gamma = 0;
+                                }
+                                else{
+                                    debug("MCCVisc: FATAL negative delta_gamma = ", delta_gamma);
+                                    exit = 1;
+                                }
+                            }
+                        }
+                        else{ // visc_exponent is not one
+
+                            delta_gamma = 0.01 * (q_trial - q_yield) / f_mu_prefac; // initial guess
+
+                            int max_iter = 60;
+                            for (int iter = 0; iter < max_iter; iter++) {
+                                if (iter == max_iter - 1){ // did not break loop
+                                    debug("MCCVisc: FATAL did not exit loop at iter = ", iter);
+                                    exit = 1;
+                                }
+
+                                T tm = visc_time * delta_gamma + dt;
+                                T tmp = dt / tm;
+                                T tmp1 = std::pow(tmp, visc_exponent);
+
+                                T residual = (q_trial - f_mu_prefac * delta_gamma) * tmp1 - q_yield;
+                                if (std::abs(residual) < 1e-2) {
+                                    break;
+                                }
+
+                                T residual_diff = -f_mu_prefac * tmp1 + (q_trial - f_mu_prefac * delta_gamma) * visc_exponent * std::pow(tmp, visc_exponent - 1) * (-visc_time * dt) / (tm * tm);
+
+                                T diff_tol = 1e-14;
+                                if (std::abs(residual_diff) < diff_tol){ // otherwise division by zero
+                                    debug("MCCVisc: WARNING residual_diff too small in abs value = ", residual_diff);
+                                    residual_diff = (residual_diff >= 0 ? diff_tol : -diff_tol);
+                                }
+
+                                delta_gamma -= residual / residual_diff;
+
+                                if (delta_gamma < 0) // not possible and can also lead to division by zero
+                                    delta_gamma = 1e-10;
+
+                            } // end N-R iterations
+
+                        } // end if visc_exponent == 1
+
+                        q_stress = std::max(q_yield, q_trial - f_mu_prefac * delta_gamma); // delta_gamma = dt * gamma_dot_S
+
+                    } // end if use_duvaut_lions_formulation 
+
+                } // end if MCCVisc
+                ////////////////////////////////////////////////////////////////
+
+                eps_pl_vol_inst = - b * (p_trial - p_stress) / K;
+                eps_pl_dev_inst =   b * (q_trial - q_stress) / e_mu_prefac;
+                
+                particles.eps_pl_vol[p] += eps_pl_vol_inst;
+                particles.eps_pl_dev[p] += eps_pl_dev_inst;
+
+                particles.delta_gamma[p] = d_prefac * eps_pl_dev_inst / dt;
+
+                T h_vol = - p_trial / K         - eps_pl_vol_inst;
+                T h_dev = q_trial / e_mu_prefac - eps_pl_dev_inst;
+                hencky = h_dev * hencky_deviatoric + (h_vol/dim) * TV::Ones();
+                particles.F[p] = svd.matrixU() * hencky.array().exp().matrix().asDiagonal() * svd.matrixV().transpose();
+
+                if (use_mibf){
+                    if (hardening_law == HardeningLaw::ExpoImpl){
+                        p_c = std::max(T(0), p0 * std::exp(-xi*particles.eps_pl_vol[p]));
+                    }
+                    else if (hardening_law == HardeningLaw::SinhImpl){
+                        p_c = std::max(T(0), K * std::sinh(-xi*particles.eps_pl_vol[p] + std::asinh(p0/K)));
+                    }
+
+                    if ( (p_stress < -beta * p_c + stress_tolerance) || (p_stress > p_c - stress_tolerance) ){
+                        particles.muI[p] = M;
+                    }
+                    else{
+                        if (use_duvaut_lions_formulation){
+                            particles.muI[p] = ( (e_mu_prefac*h_dev-q_trial*(1-b))/b ) / std::sqrt((p_stress + beta * p_c) * (p_c - p_stress));
+                        }
+                        else{
+                            particles.muI[p] = q_stress / std::sqrt((p_stress + beta * p_c) * (p_c - p_stress));
+                        }
+                    }
+                } // end if use_mibf
+
+            } // end if perform_rma
+        } // end MCC or MCCVisc
+
+
+        // Get new stress
+        TM Fe = particles.F[p];
+        TM dPsidF;
+        if (elastic_model == ElasticModel::NeoHookean){
+            dPsidF = mu * (Fe - Fe.transpose().inverse()) + lambda * std::log(Fe.determinant()) * Fe.transpose().inverse();
+            particles.tau[p] = dPsidF * Fe.transpose();
+        }
+        else if (elastic_model == ElasticModel::Hencky){
+            T e_trace = hencky.sum();
+            TV Kirchhoff_principal = lambda*e_trace*TV::Ones() + T(2.)*mu*hencky;
+            particles.tau[p] = svd.matrixU() * Kirchhoff_principal.array().matrix().asDiagonal() * svd.matrixU().transpose();
+        }
+        else{
+            debug("You specified an unvalid ELASTIC model!");
+        }
+
+
+        if (calculate_energy){
+            TV eps_pl_inst = (eps_pl_vol_inst/dim) * TV::Ones() + eps_pl_dev_inst * hencky_deviatoric;
+            TM eps_pl_inst_matrix =  svd.matrixU() * eps_pl_inst.array().matrix().asDiagonal() * svd.matrixU().transpose(); // = (plastic velocity gradient) * dt
+            particles.Ed[p] += particle_volume * doubleDot(particles.tau[p], eps_pl_inst_matrix);
+        }
+
+    } // end plastic_model type
+
+    else{
+        debug("You specified an unvalid PLASTIC model!");
+    }
+
+} // end plasticity
